@@ -1,0 +1,143 @@
+import torch
+
+def square_distance(src, dst):
+    """
+    dist = (xn - xm)^2 + (yn - ym)^2 + (zn - zm)^2
+	     = sum(src**2,dim=-1)+sum(dst**2,dim=-1)-2*src^T*dst
+    Input:
+        src: source points, [B, N, C]
+        dst: target points, [B, M, C]
+    Output:
+        dist: per-point square distance, [B, N, M]
+    """
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1)) # 2*(xn * xm + yn * ym + zn * zm)
+    dist += torch.sum(src ** 2, -1).view(B, N, 1) # xn*xn + yn*yn + zn*zn
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M) # xm*xm + ym*ym + zm*zm
+    return dist
+
+def farthest_point_sample(xyz, npoint):
+    """
+    Input:
+        xyz: pointcloud data, [B, N, C]
+        npoint: number of samples
+    Return:
+        centroids: sampled pointcloud index, [B, npoint]
+    """
+    device = xyz.device
+    B, N, C = xyz.shape
+    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
+    distance = torch.ones(B, N).to(device) * 1e10
+    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
+    batch_indices = torch.arange(B, dtype=torch.long).to(device)
+    for i in range(npoint):
+    	# 更新第i个最远点
+        centroids[:, i] = farthest
+        # 取出这个最远点的xyz坐标
+        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
+        # 计算点集中的所有点到这个最远点的欧式距离
+        dist = torch.sum((xyz - centroid) ** 2, -1)
+        # 更新distances，记录样本中每个点距离所有已出现的采样点的最小距离
+        mask = dist < distance
+        distance[mask] = dist[mask]
+        # 从更新后的distances矩阵中找出距离最远的点，作为最远点用于下一轮迭代
+        farthest = torch.max(distance, -1)[1]
+    return centroids
+
+def index_points(points, idx):
+    """
+    Input:
+        points: input points data, [B, N, C]
+        idx: sample index data, [B, D1,...DN]
+    Return:
+        new_points:, indexed points data, [B, D1,...DN, C]
+    """
+    device = points.device
+    B = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
+    new_points = points[batch_indices, idx, :]
+    return new_points
+
+def query_ball_point(radius, nsample, xyz, new_xyz):
+    """
+    Input:
+        radius: local region radius
+        nsample: max sample number in local region
+        xyz: all points, [B, N, C]
+        new_xyz: query points, [B, S, C]
+    Return:
+        group_idx: grouped points index, [B, S, nsample]
+    """
+    device = xyz.device
+    B, N, C = xyz.shape
+    _, S, _ = new_xyz.shape
+    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
+    # sqrdists: [B, S, N] 记录中心点与所有点之间的欧几里德距离
+    sqrdists = square_distance(new_xyz, xyz)
+    # 找到所有距离大于radius^2的，其group_idx直接置为N；其余的保留原来的值
+    group_idx[sqrdists > radius ** 2] = N
+    # 做升序排列，前面大于radius^2的都是N，会是最大值，所以会直接在剩下的点中取出前nsample个点
+    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
+    # 考虑到有可能前nsample个点中也有被赋值为N的点（即球形区域内不足nsample个点），这种点需要舍弃，直接用第一个点来代替即可
+    # group_first: [B, S, k]， 实际就是把group_idx中的第一个点的值复制为了[B, S, K]的维度，便利于后面的替换
+    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
+    # 找到group_idx中值等于N的点
+    mask = group_idx == N
+    # 将这些点的值替换为第一个点的值
+    group_idx[mask] = group_first[mask]
+    return group_idx
+
+def sample_and_group(npoint, radius, nsample, xyz, points):
+    """
+    Input:
+        npoint: Number of point for FPS
+        radius: Radius of ball query
+        nsample: Number of point for each ball query
+        xyz: Old feature of points position data, [B, N, C]
+        points: New feature of points data, [B, N, D]
+    Return:
+        new_xyz: sampled points position data, [B, npoint, C]
+        new_points: sampled points data, [B, npoint, nsample, C+D]
+    """
+    B, N, C = xyz.shape
+    # 从原点云中挑出最远点采样的采样点为new_xyz
+    new_xyz = index_points(xyz, farthest_point_sample(xyz, npoint))
+    # idx:[B, npoint, nsample] 代表npoint个球形区域中每个区域的nsample个采样点的索引
+    idx = query_ball_point(radius, nsample, xyz, new_xyz)
+    # grouped_xyz:[B, npoint, nsample, C]
+    grouped_xyz = index_points(xyz, idx)
+    # grouped_xyz减去采样点即中心值
+    grouped_xyz -= new_xyz.view(B, npoint, 1, C)
+    # 如果每个点上面有新的特征的维度，则用新的特征与旧的特征拼接，否则直接返回旧的特征
+    if points is not None:
+        grouped_points = index_points(points, idx)
+        new_points = torch.cat([grouped_xyz, grouped_points], dim=-1)
+    else:
+        new_points = grouped_xyz
+    return new_xyz, new_points
+
+
+def sample_and_group_all(xyz, points):
+    """
+    Input:
+        xyz: input points position data, [B, N, C]
+        points: input points data, [B, N, D]
+    Return:
+        new_xyz: sampled points position data, [B, 1, C]
+        new_points: sampled points data, [B, 1, N, C+D]
+    """
+    device = xyz.device
+    B, N, C = xyz.shape
+    new_xyz = torch.zeros(B, 1, C).to(device)
+    grouped_xyz = xyz.view(B, 1, N, C)
+    if points is not None:
+        new_points = torch.cat([grouped_xyz, points.view(B, 1, N, -1)], dim=-1)
+    else:
+        new_points = grouped_xyz
+    return new_xyz, new_points
+
